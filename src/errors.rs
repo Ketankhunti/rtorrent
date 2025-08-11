@@ -40,9 +40,22 @@ pub enum TrackerError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerError {
+    /// Failed to establish a TCP connection with the peer.
+    ConnectionFailed(String),
+    /// Failed to send the handshake message to the peer.
+    HandshakeSendFailed(String),
+    /// Failed to read the handshake response from the peer.
+    HandshakeReadFailed(String),
+    /// The peer sent back a handshake with an info_hash that doesn't match ours.
+    MismatchedInfoHash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppError {
     Bencode(BencodeError),
     Tracker(TrackerError),
+    Peer(PeerError),
 }
 
 impl From<BencodeError> for AppError {
@@ -54,5 +67,11 @@ impl From<BencodeError> for AppError {
 impl From<TrackerError> for AppError {
     fn from(e: TrackerError) -> Self {
         AppError::Tracker(e)
+    }
+}
+
+impl From<PeerError> for AppError {
+    fn from(e: PeerError) -> Self {
+        AppError::Peer(e)
     }
 }
