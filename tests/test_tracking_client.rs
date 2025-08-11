@@ -1,9 +1,12 @@
+use std::env;
+
 use rtorrent::{bencode_parser::parse, tracker, utils::{build_tracker_url, calculate_info_hash, generate_peer_id}};
 
 #[tokio::test]
 async fn test_tracker_connection() {
     // 1. Define the path to the torrent file
-    let torrent_path = "C:\\Users\\khunt\\Downloads\\ubuntu-25.04-desktop-amd64.iso.torrent";
+    let torrent_path = env::var("TORRENT_PATH")
+        .expect("Please set TORRENT_PATH environment variable");
     println!("Reading torrent file: {}", torrent_path);
 
     // 2. Read the file's raw bytes
