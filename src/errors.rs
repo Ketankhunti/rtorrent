@@ -49,6 +49,11 @@ pub enum PeerError {
     HandshakeReadFailed(String),
     /// The peer sent back a handshake with an info_hash that doesn't match ours.
     MismatchedInfoHash,
+
+    MessageReadFailed(String),
+    MessageSendFailed(String),
+    UnknownMessageId(u8),
+    InvalidMessageFormat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

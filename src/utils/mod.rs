@@ -1,6 +1,4 @@
 
-pub mod peer;
-
 use std::str::from_utf8;
 use crate::{bencode_parser::BencodeValue, errors::{AppError, BencodeError}};
 use sha1::{Sha1,Digest};
@@ -49,45 +47,73 @@ pub fn generate_peer_id() -> [u8; 20] {
     peer_id
 }
 
-pub fn build_tracker_url(
+
+/// Parses the bencoded torrent data to extract essential information.
+pub fn get_torrent_info(
     bencode_data: &BencodeValue,
-    info_hash: &[u8;20],
-    peer_id: &[u8;20],
-) -> Result<String, AppError> {
-        let (announce_url, total_size) = if let BencodeValue::Dictionary(root) = bencode_data {
-            let announce = root
-                .get(&b"announce".to_vec())
-                .and_then(|v|  if let BencodeValue::String(s) = v {Some(s)} else {None})
-            .ok_or(BencodeError::MissingAnnounceURL)?;
-        
-
-        let info = root
-                .get(&b"info".to_vec())
-                .and_then(|v| if let BencodeValue::Dictionary(d) = v { Some(d) } else { None })
-                .ok_or(BencodeError::MissingInfoDict)?;
-
-        let size = if let Some(BencodeValue::Integer(length)) = info.get(&b"length".to_vec()) {
-                    *length as u64
-        } else if let Some(BencodeValue::List(files)) = info.get(&b"files".to_vec()) {
-            files.iter().map(|file| {
-                if let BencodeValue::Dictionary(file_dict) = file {
-                    if let Some(BencodeValue::Integer(len)) = file_dict.get(&b"length".to_vec()) {
-                        return *len as u64;
-                    }
-                }
-                0
-            }).sum()
-        }else{
-            0
-        };
-
-        (from_utf8(announce).unwrap().to_string(),size) 
-        
-    } else{
-        return Err(BencodeError::RootNotADictionary.into());
+) -> Result<(String, [u8; 20], usize, u64), AppError> {
+    let root_dict = match bencode_data {
+        BencodeValue::Dictionary(d) => d,
+        _ => return Err(BencodeError::RootNotADictionary.into()),
     };
 
-    let info_hash_encoded  = urlencoding::encode_binary(info_hash);
+    let announce_url = root_dict
+        .get(&b"announce".to_vec())
+        .and_then(|v| if let BencodeValue::String(s) = v { Some(s) } else { None })
+        .ok_or(BencodeError::MissingAnnounceURL)?;
+
+    let info_dict = root_dict
+        .get(&b"info".to_vec())
+        .ok_or(BencodeError::MissingInfoDict)?;
+    
+    let info_map = match info_dict {
+        BencodeValue::Dictionary(d) => d,
+        _ => return Err(BencodeError::InvalidType.into()),
+    };
+
+    let info_bytes = encode(info_dict);
+    let mut hasher = Sha1::new();
+    hasher.update(&info_bytes);
+    let info_hash: [u8; 20] = hasher.finalize().into();
+
+    let pieces_bytes = info_map
+        .get(&b"pieces".to_vec())
+        .and_then(|v| if let BencodeValue::String(s) = v { Some(s) } else { None })
+        .ok_or(BencodeError::InvalidType)?;
+
+    let num_pieces = pieces_bytes.len() / 20;
+
+    let total_size = if let Some(BencodeValue::Integer(length)) = info_map.get(&b"length".to_vec()) {
+        *length as u64
+    } else if let Some(BencodeValue::List(files)) = info_map.get(&b"files".to_vec()) {
+        files.iter().map(|file| {
+            if let BencodeValue::Dictionary(file_dict) = file {
+                if let Some(BencodeValue::Integer(len)) = file_dict.get(&b"length".to_vec()) {
+                    return *len as u64;
+                }
+            }
+            0
+        }).sum()
+    } else {
+        0
+    };
+
+    Ok((
+        String::from_utf8_lossy(announce_url).to_string(),
+        info_hash,
+        num_pieces,
+        total_size
+    ))
+}
+
+/// Constructs the full tracker URL for the initial "started" announce event.
+pub fn build_tracker_url(
+    announce_url: &str,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    total_size: u64,
+) -> Result<String, AppError> {
+    let info_hash_encoded = urlencoding::encode_binary(info_hash);
     let peer_id_encoded = urlencoding::encode_binary(peer_id);
 
     let request_url = format!(
@@ -100,7 +126,6 @@ pub fn build_tracker_url(
 
     Ok(request_url)
 }
-
 
 pub fn calculate_info_hash(bencode_data: &BencodeValue) -> Result<[u8;20], &'static str> {
     if let BencodeValue::Dictionary(root_dict) = bencode_data {

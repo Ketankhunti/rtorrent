@@ -3,3 +3,7 @@ pub mod bencode_parser;
 pub mod utils;
 pub mod tracker;
 pub mod peer;
+pub mod torrent;
+pub mod peer_manager;
+pub mod piece_manager;
+pub mod messages;
