@@ -1,3 +1,6 @@
+
+pub mod peer;
+
 use std::str::from_utf8;
 use crate::{bencode_parser::BencodeValue, errors::{AppError, BencodeError}};
 use sha1::{Sha1,Digest};
