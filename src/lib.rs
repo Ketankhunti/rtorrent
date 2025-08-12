@@ -7,3 +7,5 @@ pub mod torrent;
 pub mod peer_manager;
 pub mod piece_manager;
 pub mod messages;
+pub mod storage;
+pub mod disk;

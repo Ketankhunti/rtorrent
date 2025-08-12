@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use crate::errors::{AppError, PeerError};
-use crate::messages::{ControlMessage, PeerEvent};
+use crate::messages::{ControlMessage, PeerEvent, PieceManagerMessage};
+use crate::storage::StorageManager;
 use crate::tracker::Peer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -43,10 +46,11 @@ pub struct PeerSession {
     #[allow(dead_code)]
     peer: Peer,
     stream: TcpStream,
-    // Channel to send events back to the PeerManager.
-    to_manager_tx: mpsc::Sender<(String,PeerEvent)>,
-    // Channel to receive commands from the PeerManager.
-    from_manager_rx: mpsc::Receiver<ControlMessage>,
+    storage: Arc<StorageManager>,
+    to_peer_manager_tx: mpsc::Sender<(String,PeerEvent)>,
+    to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
+    from_torrent_manager_rx: mpsc::Receiver<ControlMessage>,
+    
 }
 
 impl PeerSession {
@@ -55,8 +59,11 @@ impl PeerSession {
         peer: Peer,
         info_hash: &[u8; 20],
         our_peer_id: &[u8; 20],
-        to_manager_tx: mpsc::Sender<(String,PeerEvent)>,
-        from_manager_rx: mpsc::Receiver<ControlMessage>,
+        storage: Arc<StorageManager>,
+        to_peer_manager_tx: mpsc::Sender<(String,PeerEvent)>,
+        to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
+        from_torrent_manager_rx: mpsc::Receiver<ControlMessage>,
+
     ) -> Result<Self, AppError> {
         let mut stream = Self::connect(&peer).await?;
         Self::perform_handshake(&mut stream, info_hash, our_peer_id).await?;
@@ -64,8 +71,10 @@ impl PeerSession {
         Ok(PeerSession {
             peer,
             stream,
-            to_manager_tx,
-            from_manager_rx,
+            storage,
+            to_peer_manager_tx,
+            to_piece_manager_tx,
+            from_torrent_manager_rx,
         })
     }
 
@@ -89,7 +98,7 @@ impl PeerSession {
                 }
 
                 // Branch 2: Did we receive a command from our manager?
-                Some(command) = self.from_manager_rx.recv() => {
+                Some(command) = self.from_torrent_manager_rx.recv() => {
                     self.handle_manager_command(command).await?;
                 }
             }
@@ -130,17 +139,26 @@ impl PeerSession {
 
         match message {
             PeerMessage::Bitfield(bitfield) => {
-                self.to_manager_tx.send(( peer_id ,PeerEvent::BitfieldReceived(bitfield))).await.unwrap();
+               // Bitfield is a data-related event, so it goes to the PieceManager.
+               let msg = PieceManagerMessage::PeerHasBitfield { peer_id, bitfield };
+               self.to_piece_manager_tx.send(msg).await.unwrap();
             }, 
             PeerMessage::Unchoke => {
-                self.to_manager_tx.send((peer_id,PeerEvent::Unchoked)).await.unwrap();
+                self.to_peer_manager_tx.send((peer_id.clone(),PeerEvent::Unchoked)).await.unwrap();
             }
             PeerMessage::Piece { index, begin, block } => {
-                self.to_manager_tx.send((peer_id ,PeerEvent::BlockDownloaded {
+                let block_id = self.storage.store_block(block);
+                let msg = PieceManagerMessage::BlockStored {
+                    peer_id: peer_id.clone(),
                     piece_index: index,
                     block_begin: begin,
-                    block_data: block,
-                })).await.unwrap();
+                    block_id,
+                };
+        
+                self.to_piece_manager_tx.send(msg).await.unwrap();
+
+                let control_event = PeerEvent::BlockDownloaded;
+                self.to_peer_manager_tx.send((peer_id, control_event)).await.unwrap();
             }
             // Handle other messages like Choke, Have, etc.
             _ => {}

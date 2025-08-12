@@ -1,36 +1,40 @@
 //! The PeerManager, responsible for managing the pool of active peer connections.
 
-use crate::messages::{ControlMessage, PeerEvent};
+use crate::messages::{ControlMessage, PeerEvent, PieceManagerMessage};
 use crate::peer::PeerSession;
+use crate::storage::StorageManager;
 use crate::tracker::Peer;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// A handle to an active peer session, allowing the manager to send commands.
-pub struct PeerHandle {
-    pub to_worker_tx: mpsc::Sender<ControlMessage>,
-}
-
-/// A handle returned by the PeerManager, giving the TorrentManager
-/// the ability to receive events from and send commands to the peer pool.
 pub struct PeerManagerHandle {
     /// The receiver for events coming FROM all workers.
-    pub from_workers_rx: mpsc::Receiver<(String, PeerEvent)>,
+    pub from_peers_rx: mpsc::Receiver<(String, PeerEvent)>,
     /// A map to send commands TO specific workers.
-    pub to_workers_tx: HashMap<String, mpsc::Sender<ControlMessage>>,
+    pub to_peers_tx: HashMap<String, mpsc::Sender<ControlMessage>>,
 }
 
 /// Manages the lifecycle of all peer connections.
 pub struct PeerManager {
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
+    storage: Arc<StorageManager>,
+    to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
 }
 
 impl PeerManager {
-    pub fn new(info_hash: [u8; 20], our_peer_id: [u8; 20]) -> Self {
+    pub fn new(
+        info_hash: [u8; 20], 
+        our_peer_id: [u8; 20],
+        storage: Arc<StorageManager>,
+        to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
+    ) -> Self {
         PeerManager {
             info_hash,
             our_peer_id,
+            storage,
+            to_piece_manager_tx,
         }
     }
 
@@ -39,21 +43,31 @@ impl PeerManager {
     pub fn run(&mut self, initial_peers: Vec<Peer>) -> PeerManagerHandle {
         println!("PeerManager is running and spawning workers.");
 
-        let (to_manager_tx, from_workers_rx) = mpsc::channel(100);
-        let mut to_workers_tx = HashMap::new();
+        let (to_peer_manager_tx, from_peers_rx) = mpsc::channel(100);
+        let mut to_peers_tx = HashMap::new();
 
         for peer in initial_peers {
-            let (to_worker_tx, from_manager_rx) = mpsc::channel(100);
+            let (to_peer_tx, from_peer_manager_rx) = mpsc::channel(100);
             let peer_id_str = peer.socket_addr.to_string();
 
-            to_workers_tx.insert(peer_id_str.clone(), to_worker_tx);
+            to_peers_tx.insert(peer_id_str.clone(), to_peer_tx);
 
-            let to_manager_tx_clone = to_manager_tx.clone();
+            let to_peer_manager_tx_clone = to_peer_manager_tx.clone();
+            let to_piece_manager_tx_clone = self.to_piece_manager_tx.clone();
+            let storage_clone = self.storage.clone();
             let info_hash = self.info_hash;
             let our_peer_id = self.our_peer_id;
 
             tokio::spawn(async move {
-                match PeerSession::new(peer, &info_hash, &our_peer_id, to_manager_tx_clone, from_manager_rx).await {
+                match PeerSession::new(
+                    peer, 
+                    &info_hash, 
+                    &our_peer_id,
+                    storage_clone,
+                    to_peer_manager_tx_clone, 
+                    to_piece_manager_tx_clone,
+                    from_peer_manager_rx,
+                ).await {
                     Ok(mut session) => {
                         if let Err(e) = session.run().await {
                             eprintln!("Session with {} ended with error: {:?}", peer_id_str, e);
@@ -67,8 +81,8 @@ impl PeerManager {
         }
 
         PeerManagerHandle {
-            from_workers_rx,
-            to_workers_tx,
+            from_peers_rx,
+            to_peers_tx,
         }
     }
 }

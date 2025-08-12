@@ -51,7 +51,7 @@ pub fn generate_peer_id() -> [u8; 20] {
 /// Parses the bencoded torrent data to extract essential information.
 pub fn get_torrent_info(
     bencode_data: &BencodeValue,
-) -> Result<(String, [u8; 20], usize, u64), AppError> {
+) -> Result<(String, [u8; 20], Vec<[u8; 20]>, u32, u64), AppError> {
     let root_dict = match bencode_data {
         BencodeValue::Dictionary(d) => d,
         _ => return Err(BencodeError::RootNotADictionary.into()),
@@ -80,8 +80,18 @@ pub fn get_torrent_info(
         .get(&b"pieces".to_vec())
         .and_then(|v| if let BencodeValue::String(s) = v { Some(s) } else { None })
         .ok_or(BencodeError::InvalidType)?;
+    
+    let piece_hashes: Vec<[u8; 20]> = pieces_bytes
+        .chunks_exact(20)
+        .map(|chunk| chunk.try_into().expect("Chunk is not 20 bytes"))
+        .collect();
 
     let num_pieces = pieces_bytes.len() / 20;
+    
+    let piece_length = info_map
+        .get(&b"piece length".to_vec())
+        .and_then(|v| if let BencodeValue::Integer(i) = v { Some(*i as u32) } else { None })
+        .ok_or(BencodeError::InvalidType)?; // Or a more specific error
 
     let total_size = if let Some(BencodeValue::Integer(length)) = info_map.get(&b"length".to_vec()) {
         *length as u64
@@ -101,8 +111,9 @@ pub fn get_torrent_info(
     Ok((
         String::from_utf8_lossy(announce_url).to_string(),
         info_hash,
-        num_pieces,
-        total_size
+        piece_hashes,
+        piece_length,
+        total_size,
     ))
 }
 
