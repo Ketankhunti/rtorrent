@@ -50,8 +50,6 @@ impl TorrentManager{
             storage.clone(),
             to_piece_manager_tx.clone(),
         );
-
-
         tokio::spawn(async move {
             piece_manager.run().await;
         });
@@ -151,7 +149,6 @@ impl TorrentManager{
                 }
             }
         }
-
         Ok(())
     }
 }
