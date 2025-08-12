@@ -11,7 +11,7 @@ pub enum PeerEvent {
     Unchoked,
     BlockDownloaded,
 }
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub enum ControlMessage {
     RequestBlock {
         piece_index: u32,
@@ -41,6 +41,7 @@ pub enum PieceManagerMessage {
     FindPieceToDownload {
         peer_id: String,
     },
+    PeerChoked {peer_id: String},
 }
 
 #[derive(Debug)]

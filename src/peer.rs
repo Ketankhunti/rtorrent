@@ -86,18 +86,12 @@ impl PeerSession {
         // The main loop uses tokio::select! to handle multiple async sources.
         loop {
             tokio::select! {
-                // Branch 1: Did we receive a message from the remote peer?
-                result = Self::read_message(&mut self.stream) => {
+                result = Self::read_message(&mut self.stream, &self.peer) => {
                     match result {
                         Ok(message) => self.handle_peer_message(message).await?,
-                        Err(e) => {
-                            eprintln!("Error reading message from peer: {:?}", e);
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
-
-                // Branch 2: Did we receive a command from our manager?
                 Some(command) = self.from_torrent_manager_rx.recv() => {
                     self.handle_manager_command(command).await?;
                 }
@@ -177,7 +171,11 @@ impl PeerSession {
                 };
                 Self::send_message(&mut self.stream,request_msg).await?;
             }
-            // Handle other commands
+            ControlMessage::SendHave { piece_index } => {
+                println!("[PeerSession {}] Sending Have for piece #{}", self.peer.socket_addr, piece_index);
+                let have_msg = PeerMessage::Have(piece_index);
+                Self::send_message(&mut self.stream,have_msg).await?;
+            }
             _ => {}
         }
         Ok(())
@@ -215,61 +213,73 @@ impl PeerSession {
                 full_message.extend_from_slice(&payload);
                 full_message
             }
+            PeerMessage::Have(piece_index) => {
+                let mut full_message = Vec::with_capacity(9);
+                // <len=0005><id=4><piece_index>
+                full_message.extend_from_slice(&5u32.to_be_bytes());
+                full_message.push(4); // Message ID for 'Have'
+                full_message.extend_from_slice(&piece_index.to_be_bytes());
+                full_message
+            }
             _ => vec![],
         }
     }
     
-    async fn read_message(stream: &mut TcpStream) -> Result<PeerMessage, AppError> {
-        // 1. Read the 4-byte length prefix.
-        let length_prefix = stream.read_u32().await
-            .map_err(|e| PeerError::MessageReadFailed(e.to_string()))?;
+    // In src/peer.rs
 
-        // A length prefix of 0 is a KeepAlive message.
+    async fn read_message(stream: &mut TcpStream, peer: &Peer) -> Result<PeerMessage, AppError> {
+        let mut length_buf = [0u8; 4];
+        stream.read_exact(&mut length_buf).await
+            .map_err(|e| PeerError::MessageReadFailed(e.to_string()))?;
+        
+        println!("[Peer {}] Raw length prefix: {:?}", peer.socket_addr, length_buf);
+        let length_prefix = u32::from_be_bytes(length_buf);
+
         if length_prefix == 0 {
+            println!("[Peer {}] Received KeepAlive", peer.socket_addr);
             return Ok(PeerMessage::KeepAlive);
         }
 
-        // 2. Read the 1-byte message ID.
-        let message_id = stream.read_u8().await
+        let mut id_buf = [0u8; 1];
+        stream.read_exact(&mut id_buf).await
             .map_err(|e| PeerError::MessageReadFailed(e.to_string()))?;
+        
+        let message_id = id_buf[0];
+        println!("[Peer {}] Raw message ID: {}", peer.socket_addr, message_id);
 
-        // 3. Read the payload based on the length.
-        let payload_len = (length_prefix - 1) as usize; // - 1 because message id is already read
-        let mut payload = vec![0u8; payload_len];
+        let payload_len = (length_prefix - 1) as usize;
         if payload_len > 0 {
+            let mut payload = vec![0u8; payload_len];
             stream.read_exact(&mut payload).await
                 .map_err(|e| PeerError::MessageReadFailed(e.to_string()))?;
-        }
-
-        // 4. Match the message ID to the corresponding message type.
-        match message_id {
-            0 => Ok(PeerMessage::Choke),
-            1 => Ok(PeerMessage::Unchoke),
-            2 => Ok(PeerMessage::Interested),
-            3 => Ok(PeerMessage::NotInterested),
-            4 => { // Have
-                let index = u32::from_be_bytes(payload.try_into().unwrap());
-                Ok(PeerMessage::Have(index))
-            }
-            5 => { // Bitfield
-                Ok(PeerMessage::Bitfield(Bitfield { bits: payload }))
-            },
-            7 => { // <-- THIS IS THE FIX
-                if payload.len() < 8 {
-                    return Err(PeerError::InvalidMessageFormat.into()); // You'll need to add this error
+            
+            match message_id {
+                0 => Ok(PeerMessage::Choke),
+                1 => Ok(PeerMessage::Unchoke),
+                2 => Ok(PeerMessage::Interested),
+                3 => Ok(PeerMessage::NotInterested),
+                4 => Ok(PeerMessage::Have(u32::from_be_bytes(payload.try_into().unwrap()))),
+                5 => Ok(PeerMessage::Bitfield(Bitfield { bits: payload })),
+                7 => {
+                    if payload.len() < 8 { return Err(PeerError::InvalidMessageFormat.into()); }
+                    let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                    let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                    let block = payload[8..].to_vec();
+                    Ok(PeerMessage::Piece { index, begin, block })
                 }
-                let index = u32::from_be_bytes(payload[0..4].try_into().unwrap());
-                let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
-                let block = payload[8..].to_vec();
-                Ok(PeerMessage::Piece { index, begin, block })
+                _ => Err(PeerError::UnknownMessageId(message_id).into()),
             }
-            // We will implement Request, Piece, and Cancel later.
-            _ => Err(PeerError::UnknownMessageId(message_id).into()),
+        } else {
+            // Handle messages with no payload
+            match message_id {
+                0 => Ok(PeerMessage::Choke),
+                1 => Ok(PeerMessage::Unchoke),
+                2 => Ok(PeerMessage::Interested),
+                3 => Ok(PeerMessage::NotInterested),
+                _ => Err(PeerError::UnknownMessageId(message_id).into()),
+            }
         }
     }
-
-
-
 
     async fn send_message(stream: &mut TcpStream, message: PeerMessage) -> Result<(), AppError> {
         let message_bytes = Self::build_message(message);

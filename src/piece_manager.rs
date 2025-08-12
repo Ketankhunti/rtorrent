@@ -1,5 +1,5 @@
 use crate::messages::{PieceManagerEvent, PieceManagerMessage};
-use crate::peer::Bitfield;
+use crate::peer::{self, Bitfield};
 use crate::storage::{BlockId, StorageManager};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ const BLOCK_SIZE: u32 = 16384; // 16 KB
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BlockState {
     Needed,      // We need this block.
-    Requested,   // We have requested this block from a peer.
+    Requested{peer_id: String},   // We have requested this block from a peer.
     Have(BlockId), // We have downloaded this block and stored it.
 }
 
@@ -77,22 +77,26 @@ impl PieceManager {
             PieceManagerMessage::PeerHasBitfield { peer_id, bitfield } => {
                 self.add_peer_bitfield(peer_id, bitfield);
             }
-            PieceManagerMessage::BlockStored { piece_index, block_begin, block_id, .. } => {
+            PieceManagerMessage::BlockStored { peer_id, piece_index, block_begin, block_id } => {
                 let block_index = (block_begin / BLOCK_SIZE) as usize;
                 let piece_state = &mut self.pieces[piece_index as usize];
 
-                if !piece_state.is_complete && piece_state.blocks[block_index] == BlockState::Requested {
-                    piece_state.blocks[block_index] = BlockState::Have(block_id);
-                    
-                    let all_blocks_have = piece_state.blocks.iter().all(|b| matches!(b, BlockState::Have(_)));
-                    if all_blocks_have {
-                        self.verify_and_complete_piece(piece_index).await;
+                if !piece_state.is_complete {
+                    // Only accept the block if it was requested from this peer.
+                    if let BlockState::Requested { peer_id: requester_id } = &piece_state.blocks[block_index] {
+                        if *requester_id == peer_id {
+                            piece_state.blocks[block_index] = BlockState::Have(block_id);
+                            let all_blocks_have = piece_state.blocks.iter().all(|b| matches!(b, BlockState::Have(_)));
+                            if all_blocks_have {
+                                self.verify_and_complete_piece(piece_index).await;
+                            }
+                        }
                     }
                 }
             }
             PieceManagerMessage::FindPieceToDownload { peer_id } => {
                 if let Some(bitfield) = self.peer_bitfields.get(&peer_id).cloned() {
-                    if let Some((piece_index, block_index)) = self.select_block_for_peer(&bitfield) {
+                    if let Some((piece_index, block_index)) = self.select_block_for_peer(&peer_id, &bitfield) {
                         let block_begin = (block_index as u32) * BLOCK_SIZE;
                         
                         // Handle the last block which might be smaller
@@ -112,6 +116,19 @@ impl PieceManager {
                                 block_length,
                             })
                             .await.unwrap();
+                    }
+                }
+            }
+            PieceManagerMessage::PeerChoked { peer_id } => {
+                println!("[PieceManager] Peer {} choked. Resetting their requested blocks.", peer_id);
+                for piece in self.pieces.iter_mut() {
+                    for block in piece.blocks.iter_mut() {
+                        if let BlockState::Requested{peer_id: requestor_id} = block {
+                            if *requestor_id == peer_id {
+                                *block = BlockState::Needed;
+                            }
+                            
+                        }
                     }
                 }
             }
@@ -164,16 +181,16 @@ impl PieceManager {
         }
     }
 
-    fn select_block_for_peer(&mut self, peer_bitfield: &Bitfield) -> Option<(u32, u32)> {
-        // First, find a piece that is already in progress (partially downloaded).
+    fn select_block_for_peer(&mut self, peer_id: &str, peer_bitfield: &Bitfield) -> Option<(u32, u32)> {
+        // First, find a piece that is already in progress for this peer.
         if let Some((piece_index, _)) = self.pieces.iter().enumerate().find(|(idx, state)| {
             !state.is_complete &&
-            state.blocks.iter().any(|b| matches!(b, BlockState::Requested)) &&
+            state.blocks.iter().any(|b| matches!(b, BlockState::Requested { peer_id: p } if p == peer_id)) &&
             peer_bitfield.has_piece(*idx as u32)
         }) {
             let piece_state = &mut self.pieces[piece_index];
             if let Some((block_index, _)) = piece_state.blocks.iter().enumerate().find(|(_, b)| **b == BlockState::Needed) {
-                piece_state.blocks[block_index] = BlockState::Requested;
+                piece_state.blocks[block_index] = BlockState::Requested { peer_id: peer_id.to_string() };
                 return Some((piece_index as u32, block_index as u32));
             }
         }
@@ -189,10 +206,11 @@ impl PieceManager {
 
         if let Some((piece_index, piece_state)) = rarest_piece {
             if let Some((block_index, _)) = piece_state.blocks.iter().enumerate().find(|(_, b)| **b == BlockState::Needed) {
-                piece_state.blocks[block_index] = BlockState::Requested;
+                piece_state.blocks[block_index] = BlockState::Requested { peer_id: peer_id.to_string() };
                 return Some((piece_index as u32, block_index as u32));
             }
         }
         None
     }
 }
+

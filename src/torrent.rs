@@ -1,8 +1,24 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::mpsc;
 
 use crate::{disk::DiskManager, errors::AppError, messages::{ControlMessage, DiskMessage, PeerEvent, PieceManagerEvent, PieceManagerMessage}, peer_manager::PeerManager, piece_manager::PieceManager, storage::StorageManager, tracker::TrackerFactory, utils::build_tracker_url};
+
+const MAX_PIPELINED_REQUESTS: usize = 5;
+
+struct PeerState {
+    is_choked: bool,
+    in_flight_requests: usize,
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        Self {
+            is_choked: true, // Peers start as choked by default
+            in_flight_requests: 0,
+        }
+    }
+}
 
 pub struct TorrentManager {
     // --- Sub-Managers ---
@@ -13,10 +29,11 @@ pub struct TorrentManager {
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
     total_size: u64,
-    storage: Arc<StorageManager>,
+    // storage: Arc<StorageManager>,
     to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
     from_piece_manager_rx: mpsc::Receiver<PieceManagerEvent>,
     to_disk_manager_tx: mpsc::Sender<DiskMessage>,
+    peer_states: HashMap<String, PeerState>,
 }
 
 impl TorrentManager{
@@ -73,10 +90,11 @@ impl TorrentManager{
             info_hash,
             our_peer_id,
             total_size,
-            storage,
+            // storage,
             to_piece_manager_tx,
             from_piece_manager_rx,
             to_disk_manager_tx,
+            peer_states: HashMap::new(),
         }
     }
 
@@ -112,11 +130,21 @@ impl TorrentManager{
                         }
                         // This event is the key to pipelining. When a block is downloaded,
                         // we immediately ask for the next one.
-                        PeerEvent::BlockDownloaded { .. } => {
-                             self.to_piece_manager_tx
-                                .send(PieceManagerMessage::FindPieceToDownload { peer_id })
-                                .await
-                                .unwrap();
+                        PeerEvent::BlockDownloaded => {
+                            println!("[Manager] Event from {}: BlockDownloaded. Requesting next block.", peer_id);
+                            if let Some(state) = self.peer_states.get_mut(&peer_id) {
+                                state.in_flight_requests -= 1;
+                            }
+                            // Immediately request the next block to keep the pipeline full.
+                            self.request_next_blocks_for_peer(&peer_id).await;
+                        }
+                        PeerEvent::Choked => {
+                            if let Some(state) = self.peer_states.get_mut(&peer_id) {
+                                state.is_choked = true;
+                            }
+                            self.to_piece_manager_tx
+                                .send(PieceManagerMessage::PeerChoked { peer_id })
+                                .await.unwrap();
                         }
                         _ => {}
                     }
@@ -144,11 +172,35 @@ impl TorrentManager{
                             // The piece is good. Tell the DiskManager to write it.
                             let disk_msg = DiskMessage::WritePiece { piece_index, block_ids };
                             self.to_disk_manager_tx.send(disk_msg).await.unwrap();
+                            let broadcast_channels: Vec<_> = peer_manager_handle.to_peers_tx.values().cloned().collect();
+                            
+                            tokio::spawn(async move {
+                                println!("[Broadcast Task] Announcing Have for piece #{}", piece_index);
+                                let have_msg = ControlMessage::SendHave { piece_index };
+                                for tx in broadcast_channels {
+                                    // We use `send` in a loop, ignoring errors if a channel is closed.
+                                    let _ = tx.send(have_msg.clone()).await;
+                                }
+                            });
                         }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    async fn request_next_blocks_for_peer(&mut self, peer_id: &str) {
+        if let Some(state) = self.peer_states.get(peer_id) {
+            if !state.is_choked {
+                // Keep sending requests until the pipeline is full.
+                while state.in_flight_requests < MAX_PIPELINED_REQUESTS {
+                    self.to_piece_manager_tx
+                        .send(PieceManagerMessage::FindPieceToDownload { peer_id: peer_id.to_string() })
+                        .await
+                        .unwrap();
+                }
+            }
+        }
     }
 }
