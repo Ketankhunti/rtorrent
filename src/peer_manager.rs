@@ -1,7 +1,7 @@
 //! The PeerManager, responsible for managing the pool of active peer connections.
 
 use crate::messages::{ControlMessage, PeerEvent, PieceManagerMessage};
-use crate::peer::PeerSession;
+use crate::peer::{Bitfield, PeerSession};
 use crate::storage::StorageManager;
 use crate::tracker::Peer;
 use std::collections::HashMap;
@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, Mutex};
 pub struct PeerManagerHandle {
     /// The receiver for events coming FROM all workers.
     pub from_peers_rx: mpsc::Receiver<(String, PeerEvent)>,
+    pub to_peers_tx: Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>,
+
 }
 
 /// Manages the lifecycle of all peer connections.
@@ -18,6 +20,7 @@ pub struct PeerManager {
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
     storage: Arc<StorageManager>,
+    our_master_bitfield: Arc<Mutex<Bitfield>>,
     to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
     to_peers_tx: Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>,
 
@@ -28,6 +31,7 @@ impl PeerManager {
         info_hash: [u8; 20], 
         our_peer_id: [u8; 20],
         storage: Arc<StorageManager>,
+        our_master_bitfield: Arc<Mutex<Bitfield>>,
         to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
         to_peers_tx: Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>,
     ) -> Self {
@@ -35,6 +39,7 @@ impl PeerManager {
             info_hash,
             our_peer_id,
             storage,
+            our_master_bitfield,
             to_piece_manager_tx,
             to_peers_tx,
         }
@@ -59,7 +64,7 @@ impl PeerManager {
             let storage_clone = self.storage.clone();
             let info_hash = self.info_hash;
             let our_peer_id = self.our_peer_id;
-
+            let our_master_bitfield_clone = self.our_master_bitfield.clone();
             let to_peers_tx_clone = to_peers_tx.clone();
 
             tokio::spawn(async move {
@@ -68,6 +73,7 @@ impl PeerManager {
                     &info_hash, 
                     &our_peer_id,
                     storage_clone,
+                    our_master_bitfield_clone,
                     to_peer_manager_tx_clone, 
                     to_piece_manager_tx_clone,
                     from_peer_manager_rx,
@@ -91,6 +97,7 @@ impl PeerManager {
 
         PeerManagerHandle {
             from_peers_rx,
+            to_peers_tx,
         }
     }
 }

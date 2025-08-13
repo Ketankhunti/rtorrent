@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::{Arc}};
 
 use tokio::sync::{mpsc, Mutex};
 
-use crate::{disk::DiskManager, errors::AppError, messages::{ControlMessage, DiskMessage, PeerEvent, PieceManagerEvent, PieceManagerMessage, BroadcastMessage}, peer_manager::PeerManager, piece_manager::PieceManager, storage::StorageManager, tracker::TrackerFactory, utils::build_tracker_url};
+use crate::{disk::DiskManager, errors::AppError, messages::{BroadcastMessage, ControlMessage, DiskEvent, DiskMessage, PeerEvent, PieceManagerEvent, PieceManagerMessage}, peer::Bitfield, peer_manager::PeerManager, piece_manager::PieceManager, storage::StorageManager, tracker::TrackerFactory, utils::build_tracker_url};
 
 const MAX_PIPELINED_REQUESTS: usize = 5;
 
@@ -37,7 +37,8 @@ pub struct TorrentManager {
     total_pieces: usize,
     pieces_verified: usize,
     to_broadcaster_tx: mpsc::Sender<BroadcastMessage>,
-    to_peers_tx: Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>,
+    our_master_bitfield: Arc<Mutex<Bitfield>>, // Our master download state
+    from_disk_manager_rx: mpsc::Receiver<DiskEvent>
 }
 
 impl TorrentManager{
@@ -54,10 +55,19 @@ impl TorrentManager{
         let total_pieces = piece_hashes.len();
         let to_peers_tx:Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>> = Arc::new(Mutex::new(HashMap::new()));
 
+         // It's all zeros initially because we have no pieces.
+         let num_bitfield_bytes = (total_pieces as f64 / 8.0).ceil() as usize;
+         let our_master_bitfield = Arc::new(Mutex::new(Bitfield {
+             bits: vec![0; num_bitfield_bytes],
+         }));
+
         let (to_piece_manager_tx, from_peers_rx) = mpsc::channel(100);
         let (to_torrent_manager_tx, from_piece_manager_rx) = mpsc::channel(100);
         let (to_broadcaster_tx, mut from_torrent_manager_bdst) = mpsc::channel(100);
         let (to_disk_manager_tx, from_torrent_manager_rx) = mpsc::channel(100);
+
+        let (to_torrent_manager_tx_disk, from_disk_manager_rx) = mpsc::channel(100); // NEW
+
 
         let channels_for_broadcast = to_peers_tx.clone();
         tokio::spawn(async move {
@@ -79,6 +89,7 @@ impl TorrentManager{
             info_hash,
             our_peer_id,
             storage.clone(),
+            our_master_bitfield.clone(),
             to_piece_manager_tx.clone(),
             to_peers_tx.clone(),
         );
@@ -103,6 +114,7 @@ impl TorrentManager{
             piece_length,
             storage.clone(),
             from_torrent_manager_rx,
+            to_torrent_manager_tx_disk,
         ).await.unwrap();
 
         tokio::spawn(async move {
@@ -124,7 +136,8 @@ impl TorrentManager{
             total_pieces,
             pieces_verified:0,
             to_broadcaster_tx,
-            to_peers_tx,
+            our_master_bitfield,
+            from_disk_manager_rx,
         }
     }
 
@@ -176,6 +189,11 @@ impl TorrentManager{
                                 .send(PieceManagerMessage::PeerChoked { peer_id })
                                 .await.unwrap();
                         }
+                        PeerEvent::BlockRequested { piece_index, block_begin, block_length } => {
+                            println!("[Manager] Event from {}: BlockRequested for piece #{}", peer_id, piece_index);
+                            let disk_msg = DiskMessage::ReadBlock { peer_id, piece_index, block_begin, block_length };
+                            self.to_disk_manager_tx.send(disk_msg).await.unwrap();
+                        }
                         _ => {}
                     }
                 }
@@ -191,7 +209,7 @@ impl TorrentManager{
                                 block_begin,
                                 block_length,
                             };
-                            if let Some(peer_tx) = self.to_peers_tx.lock().await.get(&peer_id) {
+                            if let Some(peer_tx) = peer_manager_handle.to_peers_tx.lock().await.get(&peer_id) {
                                 if peer_tx.send(command).await.is_err() {
                                     eprintln!("[TorrentManager] Error: Failed to send command to peer {}. Channel closed.", peer_id);
                                 }
@@ -201,7 +219,12 @@ impl TorrentManager{
                             self.pieces_verified += 1;
                             let progress = (self.pieces_verified as f32 / self.total_pieces as f32) * 100.0;
                             println!("[TorrentManager] Event from PieceManager: Piece #{} is verified!", piece_index);
-                            // The piece is good. Tell the DiskManager to write it.
+                            
+                            { // Scoped lock
+                                let mut bitfield = self.our_master_bitfield.lock().await;
+                                bitfield.set_piece(piece_index);
+                            }
+
                             let disk_msg = DiskMessage::WritePiece { piece_index, block_ids };
                             self.to_disk_manager_tx.send(disk_msg).await.unwrap();
                             
@@ -209,6 +232,19 @@ impl TorrentManager{
                                 .send(BroadcastMessage::Have(piece_index))
                                 .await
                                 .unwrap();
+                        }
+                    }
+                }
+                Some(event) = self.from_disk_manager_rx.recv() => {
+                    match event {
+                        DiskEvent::BlockRead { peer_id, piece_index, block_begin, block_data } => {
+                            println!("[Manager] Event from DiskManager: Sending block at {} for piece #{} to peer {}", block_begin, piece_index, peer_id);
+                            let command = ControlMessage::SendBlock { piece_index, block_begin, block_data };
+                            if let Some(peer_tx) = peer_manager_handle.to_peers_tx.lock().await.get(&peer_id) {
+                                if peer_tx.send(command).await.is_err() {
+                                    eprintln!("[Manager] Error: Failed to send block to peer {}.", peer_id);
+                                }
+                            }
                         }
                     }
                 }

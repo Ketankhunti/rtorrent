@@ -6,7 +6,7 @@ use crate::storage::StorageManager;
 use crate::tracker::Peer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 
@@ -39,6 +39,16 @@ impl Bitfield {
         let bit_index = 7 - (index % 8);
         (self.bits[byte_index] >> bit_index) & 1 != 0
     }
+
+    pub fn set_piece(&mut self, index: u32) {
+        let byte_index = (index / 8) as usize;
+        if byte_index < self.bits.len() {
+            let bit_index = 7 - (index % 8);
+            // Use a bitwise OR to set only the specific bit to 1.
+            // 1 << bit_index creates a mask (e.g., 00100000)
+            self.bits[byte_index] |= 1 << bit_index;
+        }
+    }
 }
 
 /// The main struct for managing the state and logic of a single peer connection.
@@ -50,6 +60,13 @@ pub struct PeerSession {
     to_peer_manager_tx: mpsc::Sender<(String,PeerEvent)>,
     to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
     from_torrent_manager_rx: mpsc::Receiver<ControlMessage>,
+    our_master_bitfield: Arc<Mutex<Bitfield>>,
+    // --- Peer State ---
+    peer_is_interested: bool,
+    we_are_unchoked: bool, // Are we unchoked by the peer?
+    // --- Our State ---
+    we_are_interested: bool,
+    peer_is_choked: bool, // Are we choking the peer?
     
 }
 
@@ -60,6 +77,7 @@ impl PeerSession {
         info_hash: &[u8; 20],
         our_peer_id: &[u8; 20],
         storage: Arc<StorageManager>,
+        our_master_bitfield: Arc<Mutex<Bitfield>>,
         to_peer_manager_tx: mpsc::Sender<(String,PeerEvent)>,
         to_piece_manager_tx: mpsc::Sender<PieceManagerMessage>,
         from_torrent_manager_rx: mpsc::Receiver<ControlMessage>,
@@ -72,9 +90,14 @@ impl PeerSession {
             peer,
             stream,
             storage,
+            our_master_bitfield,
             to_peer_manager_tx,
             to_piece_manager_tx,
             from_torrent_manager_rx,
+            peer_is_interested: false,
+            we_are_unchoked: false,
+            we_are_interested: false,
+            peer_is_choked: true, // start by chocking every peer
         })
     }
 
@@ -154,7 +177,24 @@ impl PeerSession {
                 let control_event = PeerEvent::BlockDownloaded;
                 self.to_peer_manager_tx.send((peer_id, control_event)).await.unwrap();
             }
-            // Handle other messages like Choke, Have, etc.
+            PeerMessage::Interested => {
+                println!("[PeerSession {}] Peer is now interested in us.", peer_id);
+                self.peer_is_interested = true;
+                // If we are choking them, let's unchoke them so they can download.
+                if self.peer_is_choked {
+                    self.peer_is_choked = false;
+                    Self::send_message(&mut self.stream, PeerMessage::Unchoke).await?;
+                }
+            }
+            PeerMessage::Request { index, begin, length } => {
+                println!("[PeerSession {}] Received request for piece #{}, block at {}", peer_id, index, begin);
+                let event = PeerEvent::BlockRequested {
+                    piece_index: index,
+                    block_begin: begin,
+                    block_length: length,
+                };
+                self.to_peer_manager_tx.send((peer_id, event)).await.unwrap();
+            }
             _ => {}
         }
         Ok(())
@@ -175,6 +215,15 @@ impl PeerSession {
                 println!("[PeerSession {}] Sending Have for piece #{}", self.peer.socket_addr, piece_index);
                 let have_msg = PeerMessage::Have(piece_index);
                 Self::send_message(&mut self.stream,have_msg).await?;
+            }
+            ControlMessage::SendBlock { piece_index, block_begin, block_data } => {
+                println!("[PeerSession {}] Sending block at {} for piece #{}", self.peer.socket_addr, block_begin, piece_index);
+                let piece_msg = PeerMessage::Piece {
+                    index: piece_index,
+                    begin: block_begin,
+                    block: block_data.to_vec(), // Convert Bytes to Vec<u8>
+                };
+                Self::send_message(&mut self.stream,piece_msg).await?;
             }
             _ => {}
         }
