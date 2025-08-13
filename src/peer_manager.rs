@@ -47,8 +47,8 @@ impl PeerManager {
 
     /// Spawns a session for each peer and returns a handle for communication.
     /// This method is now non-blocking.
-    pub async fn run(&mut self, initial_peers: Vec<Peer>) -> PeerManagerHandle {
-        println!("PeerManager is running and spawning workers.");
+    pub async fn run(&mut self, initial_peers: Vec<Peer>) ->Arc<Mutex<PeerManagerHandle>> {
+        // println!("[PeerManager] is running and spawning workers.");
 
         let (to_peer_manager_tx, from_peers_rx) = mpsc::channel(100);
         let to_peers_tx = Arc::new(Mutex::new(HashMap::new()));
@@ -60,6 +60,8 @@ impl PeerManager {
             to_peers_tx.lock().await.insert(peer_id_str.clone(), to_peer_tx);
 
             let to_peer_manager_tx_clone = to_peer_manager_tx.clone();
+            let disconnect_notification = to_peer_manager_tx.clone();
+
             let to_piece_manager_tx_clone = self.to_piece_manager_tx.clone();
             let storage_clone = self.storage.clone();
             let info_hash = self.info_hash;
@@ -87,17 +89,23 @@ impl PeerManager {
                         eprintln!("Failed to start session with {}: {:?}", &peer_id_str, e);
                     }
                 }
-                   // When the session ends (success or error), remove the peer from the map.
-            to_peers_tx_clone.lock().await.remove(&peer_id_str);
-            println!("[PeerManager] Cleaned up session for peer {}", &peer_id_str);
-        
+                
+                // When the session ends (success or error), notify the TorrentManager
+                let disconnect_event = (peer_id_str.clone(), PeerEvent::PeerDisconnected { peer_id: peer_id_str.clone() });
+                if disconnect_notification.send(disconnect_event).await.is_err() {
+                    eprintln!("Failed to send disconnect event for peer {}", peer_id_str);
+                }
+                
+                // Remove the peer from the map
+                to_peers_tx_clone.lock().await.remove(&peer_id_str);
+                // println!("[PeerManager] Cleaned up session for peer {}", &peer_id_str);
             });
             
         }
 
-        PeerManagerHandle {
+        Arc::new(Mutex::new(PeerManagerHandle {
             from_peers_rx,
             to_peers_tx,
-        }
+        }))
     }
 }

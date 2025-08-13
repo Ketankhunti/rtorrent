@@ -24,7 +24,25 @@ impl DiskManager {
         to_torrent_manager_tx_disk: mpsc::Sender<DiskEvent>,
     ) -> Result<Self, std::io::Error>  {
          
-         let file = OpenOptions::new()
+        // Validate total_size to prevent massive memory allocation
+        if total_size > 10_000_000_000 { // 10GB limit
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("File size {} bytes is too large (max 10GB)", total_size)
+            ));
+        }
+        
+        if total_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "File size cannot be zero"
+            ));
+        }
+
+        println!("[DiskManager] Creating file with size: {} bytes ({:.2} MB)", 
+                 total_size, total_size as f64 / 1_048_576.0);
+         
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .open(output_path)
@@ -80,32 +98,50 @@ impl DiskManager {
             } => {
                 println!("[DiskManager] Received command to read block at {} for piece #{}.", block_begin, piece_index);
 
-            // 1. Calculate the absolute byte offset in the file.
-            let offset = (piece_index as u64 * self.piece_length as u64) + block_begin as u64;
+                // Validate block_length to prevent massive memory allocation
+                if block_length > 1_000_000 { // 1MB limit per block
+                    eprintln!("[DiskManager] ERROR: Block length {} bytes is too large (max 1MB), skipping", block_length);
+                    return;
+                }
 
-            // 2. Seek to the correct position in the file.
-            if let Err(e) = self.file_handle.seek(std::io::SeekFrom::Start(offset)).await {
-                eprintln!("[DiskManager] Error seeking in file: {}", e);
-                return;
-            }
+                // Validate piece_index to prevent massive file offsets
+                if piece_index > 100_000 { // Reasonable limit for piece count
+                    eprintln!("[DiskManager] ERROR: Piece index {} is too large (max 100,000), skipping", piece_index);
+                    return;
+                }
 
-            // 3. Read the exact number of bytes for the block.
-            let mut block_data_buffer = vec![0; block_length as usize];
-            if let Err(e) = self.file_handle.read_exact(&mut block_data_buffer).await {
-                eprintln!("[DiskManager] Error reading from file: {}", e);
-                return;
-            }
+                // Validate block_begin to prevent massive offsets
+                if block_begin > 100_000_000 { // 100MB limit per piece
+                    eprintln!("[DiskManager] ERROR: Block begin {} is too large (max 100MB), skipping", block_begin);
+                    return;
+                }
 
-            let response = DiskEvent::BlockRead {
-                peer_id,
-                piece_index,
-                block_begin,
-                block_data: Bytes::from(block_data_buffer),
-            };
+                // 1. Calculate the absolute byte offset in the file.
+                let offset = (piece_index as u64 * self.piece_length as u64) + block_begin as u64;
 
-            if self.to_torrent_manager_tx_disk.send(response).await.is_err() {
-                eprintln!("[DiskManager] Error: Failed to send block data back to manager. Channel closed.");
-            }
+                // 2. Seek to the correct position in the file.
+                if let Err(e) = self.file_handle.seek(std::io::SeekFrom::Start(offset)).await {
+                    eprintln!("[DiskManager] Error seeking in file: {}", e);
+                    return;
+                }
+
+                // 3. Read the exact number of bytes for the block.
+                let mut block_data_buffer = vec![0; block_length as usize];
+                if let Err(e) = self.file_handle.read_exact(&mut block_data_buffer).await {
+                    eprintln!("[DiskManager] Error reading from file: {}", e);
+                    return;
+                }
+
+                let response = DiskEvent::BlockRead {
+                    peer_id,
+                    piece_index,
+                    block_begin,
+                    block_data: Bytes::from(block_data_buffer),
+                };
+
+                if self.to_torrent_manager_tx_disk.send(response).await.is_err() {
+                    eprintln!("[DiskManager] Error: Failed to send block data back to manager. Channel closed.");
+                }
 
             }
         }

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration};
 
 use crate::errors::{AppError, PeerError};
 use crate::messages::{ControlMessage, PeerEvent, PieceManagerMessage};
@@ -7,6 +8,7 @@ use crate::tracker::Peer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
+use tokio::time;
 
 const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 
@@ -104,8 +106,8 @@ impl PeerSession {
     /// The main loop for a peer session. It concurrently listens for incoming
     /// peer messages and commands from the manager.
     pub async fn run(&mut self) -> Result<(), AppError> {
-        println!("Session running for peer {}", self.peer.socket_addr);
-
+        // println!("Session running for peer {}", self.peer.socket_addr);
+        let mut keep_alive_tick = time::interval(Duration::from_secs(10));
         // The main loop uses tokio::select! to handle multiple async sources.
         loop {
             tokio::select! {
@@ -118,6 +120,10 @@ impl PeerSession {
                 Some(command) = self.from_torrent_manager_rx.recv() => {
                     self.handle_manager_command(command).await?;
                 }
+                // _ = keep_alive_tick.tick() => {
+                //     println!("[PeerSession {}] Sending KeepAlive.", self.peer.socket_addr);
+                //     Self::send_message(&mut self.stream, PeerMessage::KeepAlive).await?;
+                // }
             }
         }
     }
@@ -164,6 +170,7 @@ impl PeerSession {
                 self.to_peer_manager_tx.send((peer_id.clone(),PeerEvent::Unchoked)).await.unwrap();
             }
             PeerMessage::Piece { index, begin, block } => {
+                let block_len = block.len();
                 let block_id = self.storage.store_block(block);
                 let msg = PieceManagerMessage::BlockStored {
                     peer_id: peer_id.clone(),
@@ -175,10 +182,14 @@ impl PeerSession {
                 self.to_piece_manager_tx.send(msg).await.unwrap();
 
                 let control_event = PeerEvent::BlockDownloaded;
-                self.to_peer_manager_tx.send((peer_id, control_event)).await.unwrap();
+                self.to_peer_manager_tx.send((peer_id.clone(), control_event)).await.unwrap();
+
+                let bytes_event = PeerEvent::BytesDownloaded(block_len);
+                self.to_peer_manager_tx.send((peer_id, bytes_event)).await.unwrap();
+
             }
             PeerMessage::Interested => {
-                println!("[PeerSession {}] Peer is now interested in us.", peer_id);
+                // println!("[PeerSession {}] Peer is now interested in us.", peer_id);
                 self.peer_is_interested = true;
                 // If we are choking them, let's unchoke them so they can download.
                 if self.peer_is_choked {
@@ -187,7 +198,7 @@ impl PeerSession {
                 }
             }
             PeerMessage::Request { index, begin, length } => {
-                println!("[PeerSession {}] Received request for piece #{}, block at {}", peer_id, index, begin);
+                // println!("[PeerSession {}] Received request for piece #{}, block at {}", peer_id, index, begin);
                 let event = PeerEvent::BlockRequested {
                     piece_index: index,
                     block_begin: begin,
@@ -212,18 +223,22 @@ impl PeerSession {
                 Self::send_message(&mut self.stream,request_msg).await?;
             }
             ControlMessage::SendHave { piece_index } => {
-                println!("[PeerSession {}] Sending Have for piece #{}", self.peer.socket_addr, piece_index);
+                // println!("[PeerSession {}] Sending Have for piece #{}", self.peer.socket_addr, piece_index);
                 let have_msg = PeerMessage::Have(piece_index);
                 Self::send_message(&mut self.stream,have_msg).await?;
             }
             ControlMessage::SendBlock { piece_index, block_begin, block_data } => {
-                println!("[PeerSession {}] Sending block at {} for piece #{}", self.peer.socket_addr, block_begin, piece_index);
+                let block_len = block_data.len(); 
+                // println!("[PeerSession {}] Sending block at {} for piece #{}", self.peer.socket_addr, block_begin, piece_index);
                 let piece_msg = PeerMessage::Piece {
                     index: piece_index,
                     begin: block_begin,
                     block: block_data.to_vec(), // Convert Bytes to Vec<u8>
                 };
                 Self::send_message(&mut self.stream,piece_msg).await?;
+                let peer_id = self.peer.socket_addr.to_string();
+                let bytes_event = PeerEvent::BytesUploaded(block_len);
+                self.to_peer_manager_tx.send((peer_id, bytes_event)).await.unwrap();
             }
             _ => {}
         }
@@ -250,6 +265,7 @@ impl PeerSession {
 
     fn build_message(message: PeerMessage) -> Vec<u8> {
         match message {
+            PeerMessage::KeepAlive => vec![0, 0, 0, 0],
             PeerMessage::Interested => vec![0, 0, 0, 1, 2],
             PeerMessage::Request { index, begin, length } => {
                 let mut payload = Vec::with_capacity(12);
@@ -283,6 +299,13 @@ impl PeerSession {
         
         let length_prefix = u32::from_be_bytes(length_buf);
 
+        // Validate message length to prevent massive memory allocation
+        if length_prefix > 1_000_000 { // 1MB limit per message
+            return Err(PeerError::MessageReadFailed(
+                format!("Message length {} bytes is too large (max 1MB)", length_prefix)
+            ).into());
+        }
+
         if length_prefix == 0 {
             return Ok(PeerMessage::KeepAlive);
         }
@@ -294,6 +317,14 @@ impl PeerSession {
         let message_id = id_buf[0];
 
         let payload_len = (length_prefix - 1) as usize;
+        
+        // Additional validation for payload length
+        if payload_len > 999_999 { // 999KB limit (since length_prefix is already limited to 1MB)
+            return Err(PeerError::MessageReadFailed(
+                format!("Payload length {} bytes is too large (max 999KB)", payload_len)
+            ).into());
+        }
+        
         if payload_len > 0 {
             let mut payload = vec![0u8; payload_len];
             stream.read_exact(&mut payload).await

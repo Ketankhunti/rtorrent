@@ -4,6 +4,7 @@ use bytes::Bytes;
 
 use crate::peer::Bitfield;
 use crate::storage::BlockId;
+use crate::tracker::Peer;
 
 // --- Messages for the PeerManager ---
 #[derive(Debug)]
@@ -17,6 +18,9 @@ pub enum PeerEvent {
         block_begin: u32,
         block_length: u32,
     },
+    BytesDownloaded(usize),
+    BytesUploaded(usize),
+    PeerDisconnected {peer_id: String},
 }
 #[derive(Debug,Clone)]
 pub enum ControlMessage {
@@ -55,6 +59,7 @@ pub enum PieceManagerMessage {
         peer_id: String,
     },
     PeerChoked {peer_id: String},
+    PeerDisconnected {peer_id: String},
 }
 
 #[derive(Debug)]
@@ -104,4 +109,21 @@ pub enum DiskEvent {
 pub enum BroadcastMessage {
     Have(u32),
     // We could add other messages here later, like Shutdown
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadStats {
+    pub file_name: String,
+    pub progress_percent: f32,
+    pub pieces_verified: usize,
+    pub total_pieces: usize,
+    pub connected_peers: usize,
+    pub download_speed_kbps: f64,
+    pub upload_speed_kbps: f64,
+}
+
+#[derive(Debug)]
+pub enum PeerManagerCommand {
+    /// Instructs the PeerManager to connect to a new set of peers.
+    AddPeers(Vec<Peer>),
 }

@@ -40,6 +40,7 @@ async fn main() {
     let mut manager = TorrentManager::new(
         announce_url,
         "sample.txt",
+        "sample.txt".to_string(),
         info_hash,
         piece_hashes,
         piece_length,

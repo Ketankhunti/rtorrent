@@ -9,3 +9,4 @@ pub mod piece_manager;
 pub mod messages;
 pub mod storage;
 pub mod disk;
+pub mod ui;

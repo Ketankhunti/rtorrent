@@ -94,19 +94,41 @@ pub fn get_torrent_info(
         .ok_or(BencodeError::InvalidType)?; // Or a more specific error
 
     let total_size = if let Some(BencodeValue::Integer(length)) = info_map.get(&b"length".to_vec()) {
-        *length as u64
+        // Single file torrent
+        let size = *length as u64;
+        println!("[DEBUG] Single file torrent, size: {} bytes", size);
+        size
     } else if let Some(BencodeValue::List(files)) = info_map.get(&b"files".to_vec()) {
-        files.iter().map(|file| {
+        // Multi-file torrent
+        println!("[DEBUG] Multi-file torrent with {} files", files.len());
+        let total: u64 = files.iter().map(|file| {
             if let BencodeValue::Dictionary(file_dict) = file {
                 if let Some(BencodeValue::Integer(len)) = file_dict.get(&b"length".to_vec()) {
-                    return *len as u64;
+                    let file_size = *len as u64;
+                    if let Some(BencodeValue::String(path)) = file_dict.get(&b"path".to_vec()) {
+                        println!("[DEBUG] File: {} - {} bytes", String::from_utf8_lossy(path), file_size);
+                    }
+                    return file_size;
                 }
             }
             0
-        }).sum()
+        }).sum();
+        println!("[DEBUG] Total multi-file size: {} bytes", total);
+        total
     } else {
+        println!("[DEBUG] No length or files found in torrent info");
         0
     };
+
+    // Validate the calculated size
+    if total_size > 10_000_000_000 { // 10GB limit
+        println!("[DEBUG] WARNING: Calculated size {} bytes exceeds 10GB limit!", total_size);
+        println!("[DEBUG] This may indicate a parsing error or corrupted torrent file");
+    }
+    
+    if total_size == 0 {
+        println!("[DEBUG] ERROR: Calculated size is 0 bytes!");
+    }
 
     Ok((
         String::from_utf8_lossy(announce_url).to_string(),
