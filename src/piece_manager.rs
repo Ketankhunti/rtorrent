@@ -84,9 +84,11 @@ impl PieceManager {
                 if !piece_state.is_complete {
                     // Only accept the block if it was requested from this peer.
                     if let BlockState::Requested { peer_id: requester_id } = &piece_state.blocks[block_index] {
+                        println!("Block Stored: {} {}", requester_id, peer_id);
                         if *requester_id == peer_id {
                             piece_state.blocks[block_index] = BlockState::Have(block_id);
                             let all_blocks_have = piece_state.blocks.iter().all(|b| matches!(b, BlockState::Have(_)));
+                            println!("Blocks Length:{}  all_blocks_have:{}", piece_state.blocks.len(), all_blocks_have);
                             if all_blocks_have {
                                 self.verify_and_complete_piece(piece_index).await;
                             }

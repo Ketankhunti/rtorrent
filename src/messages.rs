@@ -68,3 +68,9 @@ pub enum DiskMessage {
         block_ids: Vec<BlockId>,
     },
 }
+
+#[derive(Debug, Clone)]
+pub enum BroadcastMessage {
+    Have(u32),
+    // We could add other messages here later, like Shutdown
+}

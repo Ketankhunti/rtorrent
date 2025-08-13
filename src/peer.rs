@@ -232,11 +232,9 @@ impl PeerSession {
         stream.read_exact(&mut length_buf).await
             .map_err(|e| PeerError::MessageReadFailed(e.to_string()))?;
         
-        println!("[Peer {}] Raw length prefix: {:?}", peer.socket_addr, length_buf);
         let length_prefix = u32::from_be_bytes(length_buf);
 
         if length_prefix == 0 {
-            println!("[Peer {}] Received KeepAlive", peer.socket_addr);
             return Ok(PeerMessage::KeepAlive);
         }
 
@@ -245,7 +243,6 @@ impl PeerSession {
             .map_err(|e| PeerError::MessageReadFailed(e.to_string()))?;
         
         let message_id = id_buf[0];
-        println!("[Peer {}] Raw message ID: {}", peer.socket_addr, message_id);
 
         let payload_len = (length_prefix - 1) as usize;
         if payload_len > 0 {

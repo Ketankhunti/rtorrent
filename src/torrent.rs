@@ -1,8 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::{Arc}};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
-use crate::{disk::DiskManager, errors::AppError, messages::{ControlMessage, DiskMessage, PeerEvent, PieceManagerEvent, PieceManagerMessage}, peer_manager::PeerManager, piece_manager::PieceManager, storage::StorageManager, tracker::TrackerFactory, utils::build_tracker_url};
+use crate::{disk::DiskManager, errors::AppError, messages::{ControlMessage, DiskMessage, PeerEvent, PieceManagerEvent, PieceManagerMessage, BroadcastMessage}, peer_manager::PeerManager, piece_manager::PieceManager, storage::StorageManager, tracker::TrackerFactory, utils::build_tracker_url};
 
 const MAX_PIPELINED_REQUESTS: usize = 5;
 
@@ -34,6 +34,10 @@ pub struct TorrentManager {
     from_piece_manager_rx: mpsc::Receiver<PieceManagerEvent>,
     to_disk_manager_tx: mpsc::Sender<DiskMessage>,
     peer_states: HashMap<String, PeerState>,
+    total_pieces: usize,
+    pieces_verified: usize,
+    to_broadcaster_tx: mpsc::Sender<BroadcastMessage>,
+    to_peers_tx: Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>>,
 }
 
 impl TorrentManager{
@@ -47,11 +51,38 @@ impl TorrentManager{
     ) -> Self {
         let our_peer_id = crate::utils::generate_peer_id(); // Assuming this is in a utils mod
         let storage = Arc::new(StorageManager::new());
+        let total_pieces = piece_hashes.len();
+        let to_peers_tx:Arc<Mutex<HashMap<String, mpsc::Sender<ControlMessage>>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let (to_piece_manager_tx, from_peers_rx) = mpsc::channel(100);
         let (to_torrent_manager_tx, from_piece_manager_rx) = mpsc::channel(100);
-
+        let (to_broadcaster_tx, mut from_torrent_manager_bdst) = mpsc::channel(100);
         let (to_disk_manager_tx, from_torrent_manager_rx) = mpsc::channel(100);
+
+        let channels_for_broadcast = to_peers_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = from_torrent_manager_bdst.recv().await {
+                match msg {
+                    BroadcastMessage::Have(piece_index) => {
+                        println!("[Broadcast Task] Announcing Have for piece #{}", piece_index);
+                        let have_msg = ControlMessage::SendHave { piece_index };
+                        let channels = channels_for_broadcast.lock().await;
+                        for tx in channels.values() {
+                            let _ = tx.send(have_msg.clone()).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let peer_manager = PeerManager::new(
+            info_hash,
+            our_peer_id,
+            storage.clone(),
+            to_piece_manager_tx.clone(),
+            to_peers_tx.clone(),
+        );
+        
 
         let mut piece_manager = PieceManager::new(
             piece_hashes.clone(),
@@ -61,12 +92,7 @@ impl TorrentManager{
             to_torrent_manager_tx,
         );
 
-        let peer_manager = PeerManager::new(
-            info_hash,
-            our_peer_id,
-            storage.clone(),
-            to_piece_manager_tx.clone(),
-        );
+        
         tokio::spawn(async move {
             piece_manager.run().await;
         });
@@ -95,6 +121,10 @@ impl TorrentManager{
             from_piece_manager_rx,
             to_disk_manager_tx,
             peer_states: HashMap::new(),
+            total_pieces,
+            pieces_verified:0,
+            to_broadcaster_tx,
+            to_peers_tx,
         }
     }
 
@@ -111,11 +141,11 @@ impl TorrentManager{
         let tracker_client = self.tracker_factory.get_client(&tracker_url).unwrap();
         let initial_peers = tracker_client.announce(&tracker_url).await?;
 
-        let mut peer_manager_handle = self.peer_manager.run(initial_peers);
+        let mut peer_manager_handle = self.peer_manager.run(initial_peers).await;
 
         // 3. The TorrentManager's main event loop.
         println!("TorrentManager entering main event loop.");
-        loop {
+        while self.pieces_verified < self.total_pieces {
             tokio::select! {
                 // Listen for control events from the PeerManager (e.g., a peer is ready)
                 Some((peer_id, event)) = peer_manager_handle.from_peers_rx.recv() => {
@@ -161,32 +191,32 @@ impl TorrentManager{
                                 block_begin,
                                 block_length,
                             };
-                            if let Some(peer_tx) = peer_manager_handle.to_peers_tx.get(&peer_id) {
+                            if let Some(peer_tx) = self.to_peers_tx.lock().await.get(&peer_id) {
                                 if peer_tx.send(command).await.is_err() {
                                     eprintln!("[TorrentManager] Error: Failed to send command to peer {}. Channel closed.", peer_id);
                                 }
                             }
                         }
                         PieceManagerEvent::PieceVerified { piece_index, block_ids } => {
+                            self.pieces_verified += 1;
+                            let progress = (self.pieces_verified as f32 / self.total_pieces as f32) * 100.0;
                             println!("[TorrentManager] Event from PieceManager: Piece #{} is verified!", piece_index);
                             // The piece is good. Tell the DiskManager to write it.
                             let disk_msg = DiskMessage::WritePiece { piece_index, block_ids };
                             self.to_disk_manager_tx.send(disk_msg).await.unwrap();
-                            let broadcast_channels: Vec<_> = peer_manager_handle.to_peers_tx.values().cloned().collect();
                             
-                            tokio::spawn(async move {
-                                println!("[Broadcast Task] Announcing Have for piece #{}", piece_index);
-                                let have_msg = ControlMessage::SendHave { piece_index };
-                                for tx in broadcast_channels {
-                                    // We use `send` in a loop, ignoring errors if a channel is closed.
-                                    let _ = tx.send(have_msg.clone()).await;
-                                }
-                            });
+                            self.to_broadcaster_tx
+                                .send(BroadcastMessage::Have(piece_index))
+                                .await
+                                .unwrap();
                         }
                     }
                 }
             }
         }
+        println!("\n🎉🎉🎉 DOWNLOAD COMPLETE! 🎉🎉🎉");
+        // In a full client, we would now transition to "seeding" mode.
+        // For now, we will just exit.
         Ok(())
     }
 
